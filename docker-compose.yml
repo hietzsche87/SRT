@@ -1,0 +1,16 @@
+services:
+  korail-bot:
+    build: .
+    image: korail-telegram-bot
+    container_name: korail-bot
+    restart: unless-stopped
+    env_file: .env
+    # Caddy(호스트)가 korailbotkorailbot.duckdns.org → localhost:8000 으로 프록시합니다.
+    # 외부에 직접 열리지 않도록 127.0.0.1 에만 바인딩합니다.
+    ports:
+      - "127.0.0.1:8000:8000"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
