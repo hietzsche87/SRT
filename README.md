@@ -62,8 +62,10 @@ korailbotkorailbot.duckdns.org {
 cd ~/korail-bot && git pull && docker compose up -d --build
 ```
 
-korail-mobile-api 는 Dockerfile 의 `KORAIL_API_REF` 커밋으로 고정돼 있습니다. 라이브러리를 올리려면
-그 값을 바꾸거나 `docker compose build --build-arg KORAIL_API_REF=<커밋>` 으로 빌드하세요.
+korail-mobile-api 는 빌드할 때마다 upstream `main` 의 **최신 커밋**을 받습니다. 라이브러리만 새로 나왔을 때도
+`docker compose up -d --build` 한 번이면 반영됩니다. 들어간 버전은
+`docker compose exec korail-bot cat /opt/korail-mobile-api/VERSION` 로 확인할 수 있습니다.
+특정 커밋에 묶고 싶으면 `docker compose build --build-arg KORAIL_API_REF=<커밋>` 으로 빌드하세요.
 
 ## 설정 (.env)
 
