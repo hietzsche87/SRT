@@ -22,6 +22,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY korail_bot ./korail_bot
+# 호스트의 umask(예: 077)로 체크아웃된 파일도 비루트 사용자가 읽을 수 있게 합니다.
+RUN chmod -R a+rX /app /opt/korail-mobile-api
 
 ENV PYTHONPATH=/opt/korail-mobile-api/src:/app
 
