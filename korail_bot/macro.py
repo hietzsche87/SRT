@@ -28,11 +28,12 @@ from korail_mobile_api import (
     KorailSoldOutError,
     KorailTransportError,
     ReservationHoldResponse,
+    TrainSearchContinuation,
     TrainSearchQuery,
     TrainSummary,
 )
 
-from .korail import has_general_seat, has_special_seat
+from .korail import Option, has_general_seat, has_special_seat
 
 log = logging.getLogger(__name__)
 
@@ -64,12 +65,29 @@ def pick_seat_class(train: TrainSummary, pref: SeatPref) -> KorailSeatClass | No
     return None
 
 
+def pick_seat_classes(option: Option, pref: SeatPref) -> tuple[KorailSeatClass, ...] | None:
+    """여정의 모든 구간에 좌석이 있을 때만 구간별 등급을 돌려줍니다."""
+    classes = tuple(pick_seat_class(leg, pref) for leg in option)
+    if any(c is None for c in classes):
+        return None
+    return classes  # type: ignore[return-value]
+
+
 def seat_class_label(seat_class: KorailSeatClass) -> str:
     return "특실" if seat_class is KorailSeatClass.SPECIAL else "일반실"
 
 
+def seat_classes_label(seat_classes: tuple[KorailSeatClass, ...]) -> str:
+    labels = [seat_class_label(c) for c in seat_classes]
+    return labels[0] if len(set(labels)) == 1 else "/".join(labels)
+
+
 def train_key(train: TrainSummary) -> tuple[str, str]:
     return (train.departure_date or "", train.train_no)
+
+
+def option_key(option: Option) -> tuple[tuple[str, str], ...]:
+    return tuple(train_key(leg) for leg in option)
 
 
 def departure_datetime(train: TrainSummary) -> datetime | None:
@@ -90,12 +108,17 @@ class ReserveAborted(Exception):
 class KorailLike(Protocol):
     async def login(self) -> None: ...
     async def search(self, query: TrainSearchQuery) -> list[TrainSummary]: ...
+    async def search_transfer(
+        self, query: TrainSearchQuery, continuation: TrainSearchContinuation | None = None
+    ) -> tuple[list[Option], TrainSearchContinuation | None]: ...
     async def reserve(
-        self, train: TrainSummary, seat_class: KorailSeatClass, adults: int
+        self, option: Option, seat_classes: tuple[KorailSeatClass, ...], adults: int
     ) -> ReservationHoldResponse: ...
 
 
-SuccessCallback = Callable[["MacroJob", ReservationHoldResponse, TrainSummary, KorailSeatClass], Awaitable[None]]
+SuccessCallback = Callable[
+    ["MacroJob", ReservationHoldResponse, Option, tuple[KorailSeatClass, ...]], Awaitable[None]
+]
 StopCallback = Callable[["MacroJob", str], Awaitable[None]]
 
 
@@ -104,9 +127,10 @@ class MacroJob:
     id: int
     chat_id: int
     query: TrainSearchQuery
-    targets: list[TrainSummary]
+    targets: list[Option]
     seat_pref: SeatPref
     adults: int
+    transfer: bool = False
     started_at: float = field(default_factory=time.time)
     attempts: int = 0
     errors: int = 0
@@ -116,7 +140,9 @@ class MacroJob:
     @property
     def title(self) -> str:
         q = self.query
-        return f"{q.departure_station_code}→{q.arrival_station_code} {q.departure_date[4:6]}/{q.departure_date[6:]}"
+        kind = " (환승)" if self.transfer else ""
+        return (f"{q.departure_station_code}→{q.arrival_station_code}{kind} "
+                f"{q.departure_date[4:6]}/{q.departure_date[6:]}")
 
 
 class MacroManager:
@@ -149,11 +175,13 @@ class MacroManager:
         self,
         chat_id: int,
         query: TrainSearchQuery,
-        targets: list[TrainSummary],
+        targets: list[Option],
         seat_pref: SeatPref,
         adults: int,
+        *,
+        transfer: bool = False,
     ) -> MacroJob:
-        targets = sorted(targets, key=lambda t: (t.departure_date or "", t.departure_time or ""))
+        targets = sorted(targets, key=lambda o: (o[0].departure_date or "", o[0].departure_time or ""))
         job = MacroJob(
             id=next(self._ids),
             chat_id=chat_id,
@@ -161,6 +189,7 @@ class MacroManager:
             targets=targets,
             seat_pref=seat_pref,
             adults=adults,
+            transfer=transfer,
         )
         self.jobs[job.id] = job
         job.task = asyncio.create_task(self._run(job), name=f"macro-{job.id}")
@@ -231,32 +260,37 @@ class MacroManager:
             job.errors = 0
             await asyncio.sleep(self.interval + random.uniform(0, self.jitter))
 
-    def _remaining_targets(self, job: MacroJob) -> list[TrainSummary]:
+    def _remaining_targets(self, job: MacroJob) -> list[Option]:
         now = self.now()
         result = []
-        for train in job.targets:
-            departs = departure_datetime(train)
+        for option in job.targets:
+            departs = departure_datetime(option[0])
             if departs is None or departs > now:
-                result.append(train)
+                result.append(option)
         return result
 
-    async def _fetch(self, job: MacroJob, targets: list[TrainSummary]) -> dict[tuple[str, str], TrainSummary]:
-        """선택한 열차들이 모두 나올 때까지 (최대 MAX_PAGES) 검색합니다."""
-        wanted = {train_key(t) for t in targets}
-        first = targets[0]
-        query = replace(
+    def _first_query(self, job: MacroJob, targets: list[Option]) -> TrainSearchQuery:
+        first = targets[0][0]
+        return replace(
             job.query,
             departure_date=first.departure_date or job.query.departure_date,
             departure_time=(first.departure_time or job.query.departure_time)[:4] + "00",
         )
-        found: dict[tuple[str, str], TrainSummary] = {}
+
+    async def _fetch(self, job: MacroJob, targets: list[Option]) -> dict[tuple, Option]:
+        """선택한 여정들이 모두 나올 때까지 (최대 MAX_PAGES) 검색합니다."""
+        wanted = {option_key(o) for o in targets}
+        if job.transfer:
+            return await self._fetch_transfer(job, targets, wanted)
+        query = self._first_query(job, targets)
+        found: dict[tuple, Option] = {}
         for _ in range(MAX_PAGES):
             trains = await self.korail.search(query)
             if not trains:
                 break
             for train in trains:
-                if train_key(train) in wanted:
-                    found[train_key(train)] = train
+                if option_key((train,)) in wanted:
+                    found[option_key((train,))] = (train,)
             if wanted.issubset(found):
                 break
             last = trains[-1]
@@ -269,20 +303,37 @@ class MacroManager:
             query = next_query
         return found
 
-    async def _attempt(self, job: MacroJob, targets: list[TrainSummary]) -> bool:
+    async def _fetch_transfer(
+        self, job: MacroJob, targets: list[Option], wanted: set[tuple]
+    ) -> dict[tuple, Option]:
+        query = self._first_query(job, targets)
+        cursor: TrainSearchContinuation | None = None
+        found: dict[tuple, Option] = {}
+        for _ in range(MAX_PAGES):
+            options, cursor = await self.korail.search_transfer(query, cursor)
+            for option in options:
+                if option_key(option) in wanted:
+                    found[option_key(option)] = option
+            if wanted.issubset(found) or not options or cursor is None:
+                break
+        return found
+
+    async def _attempt(self, job: MacroJob, targets: list[Option]) -> bool:
         found = await self._fetch(job, targets)
         for target in targets:
-            train = found.get(train_key(target))
-            if train is None:
+            option = found.get(option_key(target))
+            if option is None:
                 continue
             if job.id not in self.jobs:  # 조회 도중 사용자가 중지함
                 return True
-            seat_class = pick_seat_class(train, job.seat_pref)
-            if seat_class is None:
+            seat_classes = pick_seat_classes(option, job.seat_pref)
+            if seat_classes is None:
                 continue
-            log.info("macro %s: %s 좌석 발견 (%s) → 예약 시도", job.id, train.train_no, seat_class.name)
+            names = "+".join(leg.train_no for leg in option)
+            log.info("macro %s: %s 좌석 발견 (%s) → 예약 시도", job.id, names,
+                     ",".join(c.name for c in seat_classes))
             try:
-                hold = await self.korail.reserve(train, seat_class, job.adults)
+                hold = await self.korail.reserve(option, seat_classes, job.adults)
             except (KorailSoldOutError, KorailSeatUnavailableError) as error:
                 # 조회와 예약 사이에 다른 사람이 가져간 경우 — 계속 시도합니다.
                 log.info("macro %s: 매진(계속): %s", job.id, error)
@@ -312,6 +363,6 @@ class MacroManager:
                     f"코레일이 예약을 거절해 중단했습니다: {error.message or error}"
                 ) from error
             self.jobs.pop(job.id, None)
-            await self.on_success(job, hold, train, seat_class)
+            await self.on_success(job, hold, option, seat_classes)
             return True
         return False

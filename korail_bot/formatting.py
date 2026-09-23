@@ -6,7 +6,7 @@ from html import escape
 
 from korail_mobile_api import ReservationHistoryResponse, ReservationHoldResponse, TrainSummary
 
-from .korail import has_general_seat, has_special_seat
+from .korail import Option, has_general_seat, has_special_seat
 
 WEEKDAYS = "월화수목금토일"
 
@@ -42,15 +42,43 @@ def train_line(train: TrainSummary) -> str:
     )
 
 
-def hold_message(hold: ReservationHoldResponse, train: TrainSummary, seat_label: str) -> str:
-    lines = [
-        "🎉 <b>예약 성공!</b>",
-        "",
-        f"🚆 {escape(train_name(train))} ({escape(seat_label)})",
-        f"📍 {escape(train.departure_station_name or '')} {hhmm(train.departure_time)} → "
-        f"{escape(train.arrival_station_name or '')} {hhmm(train.arrival_time)}",
-        f"📅 {ymd(train.departure_date)}",
-    ]
+def option_line(option: Option) -> str:
+    """직통이면 열차 한 줄, 환승이면 두 구간을 합친 한 줄 (버튼용)."""
+    if len(option) == 1:
+        return train_line(option[0])
+    first, last = option[0], option[-1]
+    general = "일반 ✅" if all(has_general_seat(t) for t in option) else "일반 ❌"
+    special = "특실 ✅" if all(has_special_seat(t) for t in option) else "특실 ❌"
+    via = first.arrival_station_name or "?"
+    return (
+        f"{hhmm(first.departure_time)}→{hhmm(last.arrival_time)} {via}환승 "
+        f"{'+'.join(train_name(t) for t in option)} | {general} · {special}"
+    )
+
+
+def option_detail(option: Option) -> str:
+    """메시지 본문용 구간별 설명."""
+    lines = []
+    for i, leg in enumerate(option, 1):
+        prefix = f"{i}구간 " if len(option) > 1 else ""
+        lines.append(
+            f"{prefix}{escape(train_name(leg))} {escape(leg.departure_station_name or '')} "
+            f"{hhmm(leg.departure_time)} → {escape(leg.arrival_station_name or '')} "
+            f"{hhmm(leg.arrival_time)} ({seat_status(leg)})"
+        )
+    return "\n".join(lines)
+
+
+def hold_message(hold: ReservationHoldResponse, option: Option, seat_labels: list[str]) -> str:
+    lines = ["🎉 <b>예약 성공!</b>" + (" (환승)" if len(option) > 1 else ""), ""]
+    for i, (leg, label) in enumerate(zip(option, seat_labels, strict=True), 1):
+        prefix = f"[{i}구간] " if len(option) > 1 else ""
+        lines += [
+            f"🚆 {prefix}{escape(train_name(leg))} ({escape(label)})",
+            f"📍 {escape(leg.departure_station_name or '')} {hhmm(leg.departure_time)} → "
+            f"{escape(leg.arrival_station_name or '')} {hhmm(leg.arrival_time)}",
+        ]
+    lines.append(f"📅 {ymd(option[0].departure_date)}")
     price = hold.total_price or hold.total_fare
     if price:
         try:

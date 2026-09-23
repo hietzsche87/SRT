@@ -60,8 +60,16 @@ class FakeKorail:
                              departure_time="230000", arrival_time="235900",
                              general_reservation_code="11", special_reservation_code="13")]
 
-    async def reserve(self, train, seat_class, adults):
-        self.reserved.append((train.train_no, seat_class, adults))
+    async def search_transfer(self, query, cursor=None):
+        a = TrainSummary(train_no="009", train_group_name="KTX", departure_date=query.departure_date,
+                         departure_time="200000", arrival_time="210000", arrival_station_name="오송",
+                         general_reservation_code="11")
+        b = TrainSummary(train_no="503", train_group_name="KTX", departure_date=query.departure_date,
+                         departure_time="213000", arrival_time="233000", general_reservation_code="11")
+        return [(a, b)], None
+
+    async def reserve(self, option, seat_classes, adults):
+        self.reserved.append((tuple(t.train_no for t in option), seat_classes, adults))
         return ReservationHoldResponse(total_price="59800")
 
     def close(self):
@@ -80,8 +88,7 @@ def cb(data):
             "message": {"message_id": 99, "date": 0, "chat": CHAT, "text": "."}}}
 
 
-@pytest.mark.asyncio
-async def test_full_flow(monkeypatch):
+def _app(monkeypatch):
     for k, v in {"TELEGRAM_BOT_TOKEN": "123:abc", "KORAIL_MEMBER_NO": "1",
                  "KORAIL_PASSWORD": "pw", "ALLOWED_USER_IDS": "42"}.items():
         monkeypatch.setenv(k, v)
@@ -100,7 +107,12 @@ async def test_full_flow(monkeypatch):
     app.bot_data["macros"].korail = fake
     app.bot_data["macros"].interval = 0
     app.bot_data["macros"].jitter = 0
+    return app, request, fake
 
+
+@pytest.mark.asyncio
+async def test_full_flow(monkeypatch):
+    app, request, fake = _app(monkeypatch)
     async with app:
         async def send(payload):
             await app.process_update(Update.de_json(payload, app.bot))
@@ -121,6 +133,32 @@ async def test_full_flow(monkeypatch):
                 break
             await asyncio.sleep(0.01)
         await asyncio.sleep(0.05)
-    assert fake.reserved[0][0] == "00101" and fake.reserved[0][2] == 2
+    assert fake.reserved[0][0] == ("00101",) and fake.reserved[0][2] == 2
     texts = [c[1].get("text", "") for c in request.calls]
     assert any("예약 성공" in t for t in texts)
+
+
+@pytest.mark.asyncio
+async def test_transfer_flow(monkeypatch):
+    app, request, fake = _app(monkeypatch)
+    async with app:
+        async def send(payload):
+            await app.process_update(Update.de_json(payload, app.bot))
+
+        await send(msg("/search"))
+        await send(cb("dep:강릉"))
+        await send(cb("arr:목포"))
+        await send(cb("dt:20301001"))
+        await send(cb("tm:07"))
+        await send(cb("mode"))
+        assert "환승" in request.calls[-1][1]["text"]
+        await send(cb("tg:0"))
+        await send(cb("go"))
+        for _ in range(100):
+            if fake.reserved and not app.bot_data["macros"].jobs:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+    assert fake.reserved[0][0] == ("009", "503")
+    texts = [c[1].get("text", "") for c in request.calls]
+    assert any("예약 성공" in t and "2구간" in t for t in texts)

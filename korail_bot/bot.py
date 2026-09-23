@@ -15,7 +15,6 @@ from korail_mobile_api import (
     KorailApiError,
     KorailSeatClass,
     ReservationHoldResponse,
-    TrainSummary,
 )
 from telegram import (
     BotCommand,
@@ -41,9 +40,9 @@ from telegram.ext import (
 from telegram.warnings import PTBUserWarning
 
 from .config import Settings
-from .formatting import WEEKDAYS, hold_message, reservations_message, train_line, ymd
-from .korail import KorailService
-from .macro import KST, MacroJob, MacroManager, SeatPref, seat_class_label, train_key
+from .formatting import WEEKDAYS, hold_message, option_line, reservations_message, ymd
+from .korail import KorailService, Option
+from .macro import KST, MacroJob, MacroManager, SeatPref, option_key, seat_class_label
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +75,7 @@ HELP = (
     "🚄 <b>코레일 자동 예약 봇</b>\n\n"
     "1. <b>🔎 예약하기</b> (/search) — 출발역·도착역·날짜·시간을 고르고\n"
     "2. 원하는 열차들을 체크한 뒤 <b>▶️ 예약 시작</b>\n"
+    "   (<b>🔁 환승 보기</b>로 환승 여정도 고를 수 있고, 직통이 없으면 자동으로 환승을 보여 줍니다)\n"
     "3. 빈 좌석이 보이면 자동으로 예약(결제 전)하고 알려 드립니다.\n"
     "4. 결제는 코레일톡 앱에서 기한 안에 하세요.\n\n"
     "/status — 진행 중인 자동 예약\n"
@@ -288,42 +288,84 @@ async def got_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.effective_message.reply_text("🔎 조회 중…")
 
     ud = context.user_data
-    query = _svc(context).make_query(ud["dep"], ud["arr"], ud["date"], value, ud["adults"])
+    ud["query"] = _svc(context).make_query(ud["dep"], ud["arr"], ud["date"], value, ud["adults"])
+    note = ""
     try:
-        trains = await _svc(context).search(query)
+        found = await _load_options(context, transfer=False)
+        if not found:
+            # 직통이 없으면 앱처럼 환승 여정을 찾아 봅니다.
+            found = await _load_options(context, transfer=True)
+            note = "ℹ️ 직통 열차가 없어 환승 여정을 보여 드립니다.\n\n"
     except KorailApiError as error:
         await update.effective_message.reply_text(
             f"❌ 조회 실패: {escape(str(error))}\n역 이름이 정확한지 확인하고 /search 로 다시 시도하세요.",
             parse_mode=ParseMode.HTML,
         )
         return ConversationHandler.END
-    if not trains:
+    if not found:
         await update.effective_message.reply_text("🚫 해당 조건의 열차가 없습니다. /search 로 다시 시도하세요.")
         return ConversationHandler.END
-    ud.update(query=query, trains=trains[:MAX_TRAINS], selected=set())
     await update.effective_message.reply_text(
-        _pick_text(context), reply_markup=_pick_keyboard(context), parse_mode=ParseMode.HTML
+        note + _pick_text(context), reply_markup=_pick_keyboard(context), parse_mode=ParseMode.HTML
     )
     return PICK
 
 
+async def _load_options(context: ContextTypes.DEFAULT_TYPE, *, transfer: bool) -> bool:
+    """첫 페이지를 조회해 user_data 에 담습니다. 결과가 있으면 True."""
+    ud = context.user_data
+    if transfer:
+        options, cursor = await _svc(context).search_transfer(ud["query"])
+    else:
+        options, cursor = [(t,) for t in await _svc(context).search(ud["query"])], None
+    if not options:
+        return False
+    ud.update(transfer=transfer, options=options[:MAX_TRAINS], cursor=cursor, selected=set())
+    return True
+
+
+async def _load_more(context: ContextTypes.DEFAULT_TYPE) -> int:
+    """다음 페이지를 이어 붙이고 새로 붙은 개수를 돌려줍니다."""
+    ud = context.user_data
+    if ud["transfer"]:
+        if ud["cursor"] is None:
+            return 0
+        more, ud["cursor"] = await _svc(context).search_transfer(ud["query"], ud["cursor"])
+    else:
+        last = ud["options"][-1][0]
+        query = replace(ud["query"], departure_date=last.departure_date or ud["date"],
+                        departure_time=last.departure_time or ud["time"])
+        more = [(t,) for t in await _svc(context).search(query)]
+    known = {option_key(o) for o in ud["options"]}
+    new = [o for o in more if option_key(o) not in known]
+    ud["options"] = (ud["options"] + new)[:MAX_TRAINS]
+    return len(new)
+
+
 def _pick_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     ud = context.user_data
+    kind = "🔁 환승" if ud["transfer"] else "🚄 직통"
     return (
-        f"🚆 <b>{escape(ud['dep'])} → {escape(ud['arr'])}</b> · {ymd(ud['date'])}\n"
+        f"🚆 <b>{escape(ud['dep'])} → {escape(ud['arr'])}</b> · {ymd(ud['date'])} · {kind}\n"
         "예약할 열차를 모두 체크한 뒤 <b>▶️ 예약 시작</b>을 누르세요.\n"
         "매진이어도 체크하면 빈 좌석이 날 때까지 계속 시도합니다."
+        + ("\n환승은 두 구간 모두 좌석이 있을 때 한 번에 예약합니다." if ud["transfer"] else "")
     )
 
 
 def _pick_keyboard(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
     ud = context.user_data
     rows = []
-    for i, train in enumerate(ud["trains"]):
+    for i, option in enumerate(ud["options"]):
         mark = "☑️" if i in ud["selected"] else "⬜"
-        rows.append([InlineKeyboardButton(f"{mark} {train_line(train)}", callback_data=f"tg:{i}")])
-    if len(ud["trains"]) < MAX_TRAINS:
-        rows.append([InlineKeyboardButton("⏬ 다음 열차 더 보기", callback_data="more")])
+        rows.append([InlineKeyboardButton(f"{mark} {option_line(option)}", callback_data=f"tg:{i}")])
+    more_row = []
+    if len(ud["options"]) < MAX_TRAINS and (not ud["transfer"] or ud["cursor"] is not None):
+        more_row.append(InlineKeyboardButton("⏬ 더 보기", callback_data="more"))
+    more_row.append(InlineKeyboardButton(
+        "🚄 직통 보기" if ud["transfer"] else "🔁 환승 보기", callback_data="mode"
+    ))
+    rows.append(more_row)
     rows.append([
         InlineKeyboardButton(f"💺 {ud['seat'].label}", callback_data="seat"),
         InlineKeyboardButton(f"👤 어른 {ud['adults']}명", callback_data="pax"),
@@ -342,26 +384,32 @@ async def pick_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
     if data.startswith("tg:"):
         i = int(data[3:])
-        ud["selected"] ^= {i}
+        if i < len(ud["options"]):
+            ud["selected"] ^= {i}
     elif data == "seat":
         ud["seat"] = ud["seat"].next()
     elif data == "pax":
         ud["adults"] = ud["adults"] % MAX_ADULTS + 1
     elif data == "more":
-        last = ud["trains"][-1]
-        query = replace(ud["query"], departure_date=last.departure_date or ud["date"],
-                        departure_time=last.departure_time or ud["time"])
         try:
-            more = await _svc(context).search(query)
+            added = await _load_more(context)
         except KorailApiError as error:
             await cq.answer(f"조회 실패: {error}"[:190], show_alert=True)
             return PICK
-        known = {train_key(t) for t in ud["trains"]}
-        new = [t for t in more if train_key(t) not in known]
-        if not new:
+        if not added:
             await cq.answer("더 이상 열차가 없습니다", show_alert=True)
             return PICK
-        ud["trains"] = (ud["trains"] + new)[:MAX_TRAINS]
+    elif data == "mode":
+        want_transfer = not ud["transfer"]
+        try:
+            found = await _load_options(context, transfer=want_transfer)
+        except KorailApiError as error:
+            await cq.answer(f"조회 실패: {error}"[:190], show_alert=True)
+            return PICK
+        if not found:
+            await cq.answer("환승 여정이 없습니다" if want_transfer else "직통 열차가 없습니다",
+                            show_alert=True)
+            return PICK
     elif data == "go":
         return await _start_macro(update, context)
 
@@ -378,7 +426,7 @@ async def _start_macro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     if not ud["selected"]:
         await cq.answer("열차를 하나 이상 체크하세요", show_alert=True)
         return PICK
-    targets: list[TrainSummary] = [ud["trains"][i] for i in sorted(ud["selected"])]
+    targets = [ud["options"][i] for i in sorted(ud["selected"])]
     query = replace(ud["query"], passengers=ud["adults"])
     job = _macros(context).start(
         chat_id=update.effective_chat.id,
@@ -386,9 +434,10 @@ async def _start_macro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         targets=targets,
         seat_pref=ud["seat"],
         adults=ud["adults"],
+        transfer=ud["transfer"],
     )
     await cq.answer("자동 예약을 시작합니다")
-    names = "\n".join(f"  • {escape(train_line(t))}" for t in job.targets)
+    names = "\n".join(f"  • {escape(option_line(o))}" for o in job.targets)
     await cq.edit_message_text(
         f"▶️ <b>자동 예약 #{job.id} 시작</b>\n"
         f"{escape(job.title)} · {ud['seat'].label} · 어른 {ud['adults']}명\n{names}\n\n"
@@ -500,13 +549,14 @@ def build_application(settings: Settings) -> Application:
     hold_ids = itertools.count(1)
 
     async def on_success(
-        job: MacroJob, hold: ReservationHoldResponse, train: TrainSummary, seat_class: KorailSeatClass
+        job: MacroJob, hold: ReservationHoldResponse, option: Option,
+        seat_classes: tuple[KorailSeatClass, ...],
     ) -> None:
         hold_id = next(hold_ids)
         app.bot_data["holds"][hold_id] = hold
         await app.bot.send_message(
             job.chat_id,
-            hold_message(hold, train, seat_class_label(seat_class))
+            hold_message(hold, option, [seat_class_label(c) for c in seat_classes])
             + f"\n\n(자동 예약 #{job.id}, 조회 {job.attempts}회)",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(
@@ -569,7 +619,7 @@ def build_application(settings: Settings) -> Application:
             ARR: [CallbackQueryHandler(got_arr, pattern="^arr:"), MessageHandler(text & ~menu, got_arr)],
             DATE: [CallbackQueryHandler(got_date, pattern="^dt:"), MessageHandler(text & ~menu, got_date)],
             TIME: [CallbackQueryHandler(got_time, pattern="^tm:"), MessageHandler(text & ~menu, got_time)],
-            PICK: [CallbackQueryHandler(pick_action, pattern="^(tg:\\d+|more|seat|pax|go)$")],
+            PICK: [CallbackQueryHandler(pick_action, pattern="^(tg:\\d+|more|mode|seat|pax|go)$")],
         },
         fallbacks=[
             *cancel_handlers,

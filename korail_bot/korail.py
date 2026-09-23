@@ -26,6 +26,7 @@ from korail_mobile_api import (
     KorailSessionExpiredError,
     ReservationHistoryResponse,
     ReservationHoldResponse,
+    TrainSearchContinuation,
     TrainSearchQuery,
     TrainSummary,
     build_config_from_env,
@@ -34,6 +35,9 @@ from korail_mobile_api import (
 log = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+#: 한 번에 예약되는 여정. 직통은 구간 1개, 환승은 2개(탑승 순서대로).
+Option = tuple[TrainSummary, ...]
 
 #: 검색 결과에서 "예약 가능"을 뜻하는 좌석 코드 (라이브러리 예약 검증과 같은 규칙).
 AVAILABLE_CODE = "11"
@@ -98,12 +102,36 @@ class KorailService:
             except KorailNoResultsError:
                 return []
 
+    def search_transfer_sync(
+        self, query: TrainSearchQuery, continuation: TrainSearchContinuation | None = None
+    ) -> tuple[list[Option], TrainSearchContinuation | None]:
+        """환승 여정 한 페이지와 다음 페이지 커서."""
+        with self._lock:
+            try:
+                result = self._client.search_transfer_trains(query, continuation=continuation)
+            except KorailNoResultsError:
+                return [], None
+            options = [tuple(itinerary.legs) for itinerary in result.itineraries]
+            try:
+                cursor = result.next_page() if options else None
+            except (KorailApiError, ValueError):
+                cursor = None
+            return options, cursor
+
     def reserve_sync(
-        self, train: TrainSummary, seat_class: KorailSeatClass, adults: int
+        self, option: Option, seat_classes: tuple[KorailSeatClass, ...], adults: int
     ) -> ReservationHoldResponse:
         passengers = KorailPassengerCounts(adult=adults)
+        if len(option) == 1:
+            return self._authed(
+                lambda: self._client.reserve(
+                    option[0], passengers=passengers, seat_class=seat_classes[0]
+                )
+            )
         return self._authed(
-            lambda: self._client.reserve(train, passengers=passengers, seat_class=seat_class)
+            lambda: self._client.reserve_transfer(
+                list(option), passengers=passengers, seat_classes=list(seat_classes)
+            )
         )
 
     def cancel_sync(self, hold: ReservationHoldResponse) -> None:
@@ -128,10 +156,15 @@ class KorailService:
     async def search(self, query: TrainSearchQuery) -> list[TrainSummary]:
         return await asyncio.to_thread(self.search_sync, query)
 
+    async def search_transfer(
+        self, query: TrainSearchQuery, continuation: TrainSearchContinuation | None = None
+    ) -> tuple[list[Option], TrainSearchContinuation | None]:
+        return await asyncio.to_thread(self.search_transfer_sync, query, continuation)
+
     async def reserve(
-        self, train: TrainSummary, seat_class: KorailSeatClass, adults: int
+        self, option: Option, seat_classes: tuple[KorailSeatClass, ...], adults: int
     ) -> ReservationHoldResponse:
-        return await asyncio.to_thread(self.reserve_sync, train, seat_class, adults)
+        return await asyncio.to_thread(self.reserve_sync, option, seat_classes, adults)
 
     async def cancel(self, hold: ReservationHoldResponse) -> None:
         await asyncio.to_thread(self.cancel_sync, hold)
