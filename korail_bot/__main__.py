@@ -18,6 +18,8 @@ def main() -> None:
     )
     # httpx 는 INFO 로 요청 URL(텔레그램 토큰 포함)을 찍으므로 낮춥니다.
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    # 대화 시간 제한 작업이 추가/삭제될 때마다 찍히는 로그는 소음이라 숨깁니다.
+    logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
     settings = Settings.from_env()
     if not settings.allowed_user_ids:
