@@ -44,10 +44,11 @@ AVAILABLE_CODE = "11"
 
 
 def _build_config() -> KorailConfig:
-    # 실기기 값을 넣어 두면 재시작해도 같은 기기로 보입니다. 없으면 합성 값을 씁니다.
+    # 실기기 값을 넣어 두면 재시작해도 같은 기기로 보입니다. 없으면 라이브러리 기본값
+    # (DynaPath 켜짐, 기기 값 합성, NetFunnel 대기열 켜짐)을 씁니다.
     if os.environ.get("KORAIL_DYNAPATH_DEVICE_ID"):
         return build_config_from_env()
-    return KorailConfig(enable_dynapath=True)
+    return KorailConfig()
 
 
 def has_general_seat(train: TrainSummary) -> bool:
