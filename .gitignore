@@ -4,3 +4,9 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+
+# 개인용 텔레그램 알림 도구: telegram_notify.py 에 봇 토큰이 들어 있어 공개 저장소에 올리지 않습니다.
+# 없으면 hietzsche87/subtitle-ocr-toolkit 의 tools/ 에서 받아 옵니다 (CLAUDE.md 참고).
+/tools/telegram_ask.py
+/tools/telegram_notify.py
+/tools/telegram_sent_log.jsonl
