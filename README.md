@@ -56,6 +56,20 @@ korailbotkorailbot.duckdns.org {
 }
 ```
 
+### 자동 업데이트 (권장)
+
+서버가 10분마다 봇 코드와 korail-mobile-api `main` 에 새 커밋이 있는지 보고, 있으면 받아서 다시 빌드합니다.
+새 버전이 정상 기동하지 않으면 이전 이미지로 되돌리고, 결과를 텔레그램으로 알려 줍니다.
+
+```bash
+cd ~/korail-bot && git pull && sudo bash tools/install_auto_update.sh           # 켜기
+sudo bash ~/korail-bot/tools/install_auto_update.sh --remove                     # 끄기
+tail -n 30 /var/log/korail-bot-update.log                                         # 기록 보기
+```
+
+- 서버에서 직접 고친 파일이 있으면 지우지 않고 `git stash` 에 보관한 뒤 업데이트합니다.
+- 실패한 같은 조합(봇 커밋 + 라이브러리 커밋)은 새 커밋이 나올 때까지 다시 시도하지 않습니다.
+
 ### 업데이트
 
 ```bash
